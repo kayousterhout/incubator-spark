@@ -110,10 +110,6 @@ private[spark] class ClusterTaskSetManager(
   // Task index, start and finish time for each task attempt (indexed by task ID)
   val taskInfos = new HashMap[Long, TaskInfo]
 
-  // Did the TaskSet fail?
-  var failed = false
-  var causeOfFailure = ""
-
   // How frequently to reprint duplicate exceptions in full, in milliseconds
   val EXCEPTION_PRINT_INTERVAL =
     System.getProperty("spark.logging.exceptionPrintInterval", "10000").toLong
@@ -537,8 +533,6 @@ private[spark] class ClusterTaskSetManager(
   }
 
   def abort(message: String) {
-    failed = true
-    causeOfFailure = message
     // TODO: Kill running tasks if we were not terminated due to a Mesos error
     sched.dagScheduler.taskSetFailed(taskSet, message)
     removeAllRunningTasks()
