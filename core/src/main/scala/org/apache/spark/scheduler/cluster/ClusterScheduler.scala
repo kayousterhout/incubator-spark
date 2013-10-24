@@ -60,7 +60,6 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
 
   val taskIdToTaskSetId = new HashMap[Long, String]
   val taskIdToExecutorId = new HashMap[Long, String]
-  val taskSetTaskIds = new HashMap[String, HashSet[Long]]
 
   @volatile private var hasReceivedTask = false
   @volatile private var hasLaunchedTask = false
@@ -144,7 +143,6 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
       val manager = new ClusterTaskSetManager(this, taskSet)
       activeTaskSets(taskSet.id) = manager
       schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
-      taskSetTaskIds(taskSet.id) = new HashSet[Long]()
 
       if (!hasReceivedTask) {
         starvationTimer.scheduleAtFixedRate(new TimerTask() {
@@ -173,29 +171,23 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
       //    the stage.
       // 2. The task set manager has been created but no tasks has been scheduled. In this case,
       //    simply abort the stage.
-      val taskIds = taskSetTaskIds(tsm.taskSet.id)
-      if (taskIds.size > 0) {
-        taskIds.foreach { tid =>
-          val execId = taskIdToExecutorId(tid)
-          backend.killTask(tid, execId)
-        }
+      tsm.runningTasksSet.foreach { tid =>
+        val execId = taskIdToExecutorId(tid)
+        backend.killTask(tid, execId)
       }
       tsm.error("Stage %d was cancelled".format(stageId))
     }
   }
 
+  /**
+   * Called to indicate that all tasks attempts (including speculated tasks) associated with
+   * the given TaskSetManager have completed, so state associated with the TaskSetManager
+   * should be cleaned up.
+   */
   def taskSetFinished(manager: TaskSetManager): Unit = synchronized {
-    // Check to see if the given task set has been removed. This is possible in the case of
-    // multiple unrecoverable task failures (e.g. if the entire task set is killed when it has
-    // more than one running tasks).
-    if (activeTaskSets.contains(manager.taskSet.id)) {
-      activeTaskSets -= manager.taskSet.id
-      manager.parent.removeSchedulable(manager)
-      logInfo("Remove TaskSet %s from pool %s".format(manager.taskSet.id, manager.parent.name))
-      taskIdToTaskSetId --= taskSetTaskIds(manager.taskSet.id)
-      taskIdToExecutorId --= taskSetTaskIds(manager.taskSet.id)
-      taskSetTaskIds.remove(manager.taskSet.id)
-    }
+    activeTaskSets -= manager.taskSet.id
+    manager.parent.removeSchedulable(manager)
+    logInfo("Remove TaskSet %s from pool %s".format(manager.taskSet.id, manager.parent.name))
   }
 
   /**
@@ -237,7 +229,6 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
             tasks(i) += task
             val tid = task.taskId
             taskIdToTaskSetId(tid) = taskSet.taskSet.id
-            taskSetTaskIds(taskSet.taskSet.id) += tid
             taskIdToExecutorId(tid) = execId
             activeExecutorIds += execId
             executorsByHost(host) += execId
@@ -256,7 +247,7 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
 
   def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer) {
     var failedExecutor: Option[String] = None
-    var taskFailed = false
+    var reviveOffers = false
     synchronized {
       try {
         if (state == TaskState.LOST && taskIdToExecutorId.contains(tid)) {
@@ -271,13 +262,7 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
           case Some(taskSetId) =>
             if (TaskState.isFinished(state)) {
               taskIdToTaskSetId.remove(tid)
-              if (taskSetTaskIds.contains(taskSetId)) {
-                taskSetTaskIds(taskSetId) -= tid
-              }
               taskIdToExecutorId.remove(tid)
-            }
-            if (state == TaskState.FAILED) {
-              taskFailed = true
             }
             activeTaskSets.get(taskSetId).foreach { taskSet =>
               if (state == TaskState.FINISHED) {
@@ -286,10 +271,13 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
               } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
                 taskSet.removeRunningTask(tid)
                 taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
+                if (state == TaskState.FAILED && !taskSet.isZombie) {
+                  reviveOffers = true
+                }
               }
             }
           case None =>
-            logInfo("Ignoring update from TID " + tid + " because its task set is gone")
+            logError("Ignoring update from TID " + tid + " because its task set is gone")
         }
       } catch {
         case e: Exception => logError("Exception in statusUpdate", e)
@@ -299,8 +287,7 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
     if (failedExecutor != None) {
       dagScheduler.executorLost(failedExecutor.get)
       backend.reviveOffers()
-    }
-    if (taskFailed) {
+    } else if (reviveOffers) {
       // Also revive offers if a task had failed for some reason other than host lost
       backend.reviveOffers()
     }
@@ -323,7 +310,7 @@ private[spark] class ClusterScheduler(val sc: SparkContext)
     taskState: TaskState,
     reason: Option[TaskEndReason]) = synchronized {
     taskSetManager.handleFailedTask(tid, taskState, reason)
-    if (taskState == TaskState.FINISHED) {
+    if (!taskSetManager.isZombie && taskState == TaskState.FINISHED) {
       // The task finished successfully but the result was lost, so we should revive offers.
       backend.reviveOffers()
     }

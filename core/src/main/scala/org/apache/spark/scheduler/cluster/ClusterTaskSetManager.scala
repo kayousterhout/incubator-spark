@@ -79,7 +79,14 @@ private[spark] class ClusterTaskSetManager(
   var parent: Pool = null
 
   var runningTasks = 0
-  private val runningTasksSet = new HashSet[Long]
+  val runningTasksSet = new HashSet[Long]
+
+  // True once no more tasks should be launched for this task set manager. This can happen because
+  // at least one attempt of each task has completed successfully, or because the task set was
+  // aborted (for example, because it was killed). We keep the task set manager around while it's
+  // in the zombie state so that we can track task attempts that are still running.
+  // TODO: We should kill any running task attempts when this becomes a zombie.
+  var isZombie = false
 
   // Set of pending tasks for each executor. These collections are actually
   // treated as stacks, in which new tasks are added to the end of the
@@ -337,7 +344,7 @@ private[spark] class ClusterTaskSetManager(
       maxLocality: TaskLocality.TaskLocality)
     : Option[TaskDescription] =
   {
-    if (tasksSuccessful < numTasks && availableCpus >= CPUS_PER_TASK) {
+    if (!isZombie && availableCpus >= CPUS_PER_TASK) {
       val curTime = clock.getTime()
 
       var allowedLocality = getAllowedLocalityLevel(curTime)
@@ -420,6 +427,12 @@ private[spark] class ClusterTaskSetManager(
     sched.dagScheduler.taskGettingResult(tasks(info.index), info)
   }
 
+  private def maybeFinishTaskSet() {
+    if (isZombie && runningTasks == 0) {
+      sched.taskSetFinished(this)
+    }
+  }
+
   /**
    * Marks the task as successful and notifies the DAGScheduler that a task has ended.
    */
@@ -427,23 +440,23 @@ private[spark] class ClusterTaskSetManager(
     val info = taskInfos(tid)
     val index = info.index
     info.markSuccessful()
-    removeRunningTask(tid)
+    sched.dagScheduler.taskEnded(
+      tasks(index), Success, result.value, result.accumUpdates, info, result.metrics)
     if (!successful(index)) {
       logInfo("Finished TID %s in %d ms on %s (progress: %d/%d)".format(
         tid, info.duration, info.host, tasksSuccessful, numTasks))
-      sched.dagScheduler.taskEnded(
-        tasks(index), Success, result.value, result.accumUpdates, info, result.metrics)
 
       // Mark successful and stop if all the tasks have succeeded.
       tasksSuccessful += 1
       successful(index) = true
       if (tasksSuccessful == numTasks) {
-        sched.taskSetFinished(this)
+        isZombie = true
       }
     } else {
       logInfo("Ignorning task-finished event for TID " + tid + " because task " +
         index + " has already completed successfully")
     }
+    maybeFinishTaskSet()
   }
 
   /**
@@ -455,76 +468,73 @@ private[spark] class ClusterTaskSetManager(
     if (info.failed) {
       return
     }
-    removeRunningTask(tid)
     val index = info.index
     info.markFailed()
-    if (!successful(index)) {
+    if (!isZombie) {
       logWarning("Lost TID %s (task %s:%d)".format(tid, taskSet.id, index))
-      copiesRunning(index) -= 1
-      // Check if the problem is a map output fetch failure. In that case, this
-      // task will never succeed on any node, so tell the scheduler about it.
-      reason.foreach {
-        case fetchFailed: FetchFailed =>
-          logWarning("Loss was due to fetch failure from " + fetchFailed.bmAddress)
-          sched.dagScheduler.taskEnded(tasks(index), fetchFailed, null, null, info, null)
+    }
+    copiesRunning(index) -= 1
+    reason.foreach {
+      case fetchFailed: FetchFailed =>
+        // If the problem is a map output fetch failure, the task will never succeed on any
+        // node, so tell the scheduler about it.
+        logWarning("Loss was due to fetch failure from " + fetchFailed.bmAddress)
+        sched.dagScheduler.taskEnded(tasks(index), fetchFailed, null, null, info, null)
+        if (!successful(index)) {
           successful(index) = true
           tasksSuccessful += 1
-          sched.taskSetFinished(this)
-          removeAllRunningTasks()
-          return
+        }
+        isZombie = true
 
-        case TaskKilled =>
-          logWarning("Task %d was killed.".format(tid))
-          sched.dagScheduler.taskEnded(tasks(index), reason.get, null, null, info, null)
-          return
+      case TaskKilled =>
+        logWarning("Task %d was killed.".format(tid))
+        sched.dagScheduler.taskEnded(tasks(index), reason.get, null, null, info, null)
 
-        case ef: ExceptionFailure =>
-          sched.dagScheduler.taskEnded(tasks(index), ef, null, null, info, ef.metrics.getOrElse(null))
-          val key = ef.description
-          val now = clock.getTime()
-          val (printFull, dupCount) = {
-            if (recentExceptions.contains(key)) {
-              val (dupCount, printTime) = recentExceptions(key)
-              if (now - printTime > EXCEPTION_PRINT_INTERVAL) {
-                recentExceptions(key) = (0, now)
-                (true, 0)
-              } else {
-                recentExceptions(key) = (dupCount + 1, printTime)
-                (false, dupCount + 1)
-              }
-            } else {
+      case ef: ExceptionFailure =>
+        sched.dagScheduler.taskEnded(tasks(index), ef, null, null, info, ef.metrics.getOrElse(null))
+        val key = ef.description
+        val now = clock.getTime()
+        val (printFull, dupCount) = {
+          if (recentExceptions.contains(key)) {
+            val (dupCount, printTime) = recentExceptions(key)
+            if (now - printTime > EXCEPTION_PRINT_INTERVAL) {
               recentExceptions(key) = (0, now)
               (true, 0)
+            } else {
+              recentExceptions(key) = (dupCount + 1, printTime)
+              (false, dupCount + 1)
             }
-          }
-          if (printFull) {
-            val locs = ef.stackTrace.map(loc => "\tat %s".format(loc.toString))
-            logWarning("Loss was due to %s\n%s\n%s".format(
-              ef.className, ef.description, locs.mkString("\n")))
           } else {
-            logInfo("Loss was due to %s [duplicate %d]".format(ef.description, dupCount))
+            recentExceptions(key) = (0, now)
+            (true, 0)
           }
-
-        case TaskResultLost =>
-          logWarning("Lost result for TID %s on host %s".format(tid, info.host))
-          sched.dagScheduler.taskEnded(tasks(index), TaskResultLost, null, null, info, null)
-
-        case _ => {}
-      }
-      // On non-fetch failures, re-enqueue the task as pending for a max number of retries
-      addPendingTask(index)
-      if (state != TaskState.KILLED) {
-        numFailures(index) += 1
-        if (numFailures(index) > MAX_TASK_FAILURES) {
-          logError("Task %s:%d failed more than %d times; aborting job".format(
-            taskSet.id, index, MAX_TASK_FAILURES))
-          abort("Task %s:%d failed more than %d times".format(taskSet.id, index, MAX_TASK_FAILURES))
         }
-      }
-    } else {
-      logInfo("Ignoring task-lost event for TID " + tid +
-        " because task " + index + " is already finished")
+        if (printFull) {
+          val locs = ef.stackTrace.map(loc => "\tat %s".format(loc.toString))
+          logWarning("Loss was due to %s\n%s\n%s".format(
+            ef.className, ef.description, locs.mkString("\n")))
+        } else {
+          logInfo("Loss was due to %s [duplicate %d]".format(ef.description, dupCount))
+        }
+
+      case TaskResultLost =>
+        logWarning("Lost result for TID %s on host %s".format(tid, info.host))
+        sched.dagScheduler.taskEnded(tasks(index), TaskResultLost, null, null, info, null)
+
+      case _ => {}
     }
+    // On non-fetch failures, re-enqueue the task as pending for a max number of retries
+    addPendingTask(index)
+    if (!isZombie && state != TaskState.KILLED) {
+      numFailures(index) += 1
+      if (numFailures(index) > MAX_TASK_FAILURES) {
+        logError("Task %s:%d failed more than %d times; aborting job".format(
+          taskSet.id, index, MAX_TASK_FAILURES))
+        abort("Task %s:%d failed more than %d times".format(taskSet.id, index, MAX_TASK_FAILURES))
+        return
+      }
+    }
+    maybeFinishTaskSet()
   }
 
   override def error(message: String) {
@@ -533,10 +543,10 @@ private[spark] class ClusterTaskSetManager(
   }
 
   def abort(message: String) {
+    isZombie = true
     // TODO: Kill running tasks if we were not terminated due to a Mesos error
     sched.dagScheduler.taskSetFailed(taskSet, message)
-    removeAllRunningTasks()
-    sched.taskSetFinished(this)
+    maybeFinishTaskSet()
   }
 
   /** If the given task ID is not in the set of running tasks, adds it.
@@ -556,15 +566,6 @@ private[spark] class ClusterTaskSetManager(
       parent.decreaseRunningTasks(1)
     }
     runningTasks = runningTasksSet.size
-  }
-
-  private def removeAllRunningTasks() {
-    val numRunningTasks = runningTasksSet.size
-    runningTasksSet.clear()
-    if (parent != null) {
-      parent.decreaseRunningTasks(numRunningTasks)
-    }
-    runningTasks = 0
   }
 
   override def getSchedulableByName(name: String): Schedulable = {
