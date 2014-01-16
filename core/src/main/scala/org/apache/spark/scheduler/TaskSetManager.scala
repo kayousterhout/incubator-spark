@@ -26,8 +26,8 @@ import scala.collection.mutable.HashSet
 import scala.math.max
 import scala.math.min
 
-import org.apache.spark.{ExceptionFailure, FetchFailed, Logging, Resubmitted, SparkEnv,
-  Success, TaskEndReason, TaskKilled, TaskResultLost, TaskState}
+import org.apache.spark.{ExceptionFailure, ExecutorLostFailure, FetchFailed, Logging, Resubmitted,
+  SparkEnv, Success, TaskEndReason, TaskKilled, TaskResultLost, TaskState}
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.util.{Clock, SystemClock}
@@ -389,8 +389,7 @@ private[spark] class TaskSetManager(
           logInfo("Serialized task %s:%d as %d bytes in %d ms".format(
             taskSet.id, index, serializedTask.limit, timeTaken))
           val taskName = "task %s:%d".format(taskSet.id, index)
-          if (taskAttempts(index).size == 1)
-            taskStarted(task,info)
+          sched.dagScheduler.taskStarted(task, info)
           return Some(new TaskDescription(taskId, execId, taskName, index, serializedTask))
         }
         case _ =>
@@ -433,10 +432,6 @@ private[spark] class TaskSetManager(
     index
   }
 
-  private def taskStarted(task: Task[_], info: TaskInfo) {
-    sched.dagScheduler.taskStarted(task, info)
-  }
-
   def handleTaskGettingResult(tid: Long) = {
     val info = taskInfos(tid)
     info.markGettingResult()
@@ -473,7 +468,7 @@ private[spark] class TaskSetManager(
    * Marks the task as failed, re-adds it to the list of pending tasks, and notifies the
    * DAG Scheduler.
    */
-  def handleFailedTask(tid: Long, state: TaskState, reason: Option[TaskEndReason]) {
+  def handleFailedTask(tid: Long, state: TaskState, reason: TaskEndReason) {
     val info = taskInfos(tid)
     if (info.failed) {
       return
@@ -487,7 +482,7 @@ private[spark] class TaskSetManager(
     }
     var taskMetrics : TaskMetrics = null
     var failureReason = "unknown"
-    reason.foreach {
+    reason match {
       case fetchFailed: FetchFailed =>
         logWarning("Loss was due to fetch failure from " + fetchFailed.bmAddress)
         if (!successful(index)) {
@@ -541,8 +536,7 @@ private[spark] class TaskSetManager(
 
       case _ => {}
     }
-    sched.dagScheduler.taskEnded(tasks(index), reason.getOrElse(null), null, null, info,
-      taskMetrics)
+    sched.dagScheduler.taskEnded(tasks(index), reason, null, null, info, taskMetrics)
     addPendingTask(index)
     if (!isZombie && state != TaskState.KILLED) {
       numFailures(index) += 1
@@ -627,7 +621,7 @@ private[spark] class TaskSetManager(
     }
     // Also re-enqueue any tasks that were running on the node
     for ((tid, info) <- taskInfos if info.running && info.executorId == execId) {
-      handleFailedTask(tid, TaskState.FAILED, None)
+      handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure)
     }
   }
 
