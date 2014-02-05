@@ -601,7 +601,11 @@ class DAGScheduler(
         stageIdToStage.get(taskSet.stageId).foreach { abortStage(_, reason) }
 
       case ResubmitFailedStages =>
-        resubmitFailedStages()
+        if (failed.size > 0) {
+          // Failed stages may be removed by job cancellation, so failed might be empty even if
+          // the ResubmitFailedStages event has been scheduled.
+          resubmitFailedStages()
+        }
 
       case StopDAGScheduler =>
         // Cancel any active jobs
